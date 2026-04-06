@@ -1,0 +1,80 @@
+estoca:
+  source_system: "ESTOCA"
+  country: "BR"
+  base_url_env: "ESTOCA_BASE_URL"
+
+  stores:
+    # =========================================================================
+    # LOJA 0102 — Filial MG (Protheus)
+    # Warehouse: e2a5f9b6-af20-4009-8984-726a2be546ea
+    # =========================================================================
+    - store_code: "0102"
+      business_unit: "LOJA 0102 - MG"
+      warehouse_id: "e2a5f9b6-af20-4009-8984-726a2be546ea"
+      exclude_from_consolidation: false
+      operations:
+        - operation_type: "B2B"
+          store_id: "e7cd80bf-c880-41af-abe2-d1a666aceb82"
+          env_key: "ESTOCA_0102_B2B_API_KEY"
+          dedup_group: null
+
+        - operation_type: "B2C"
+          store_id: "504776b9-23a1-4db9-a12a-d57c764f65fb"
+          env_key: "ESTOCA_0102_B2C_API_KEY"
+          dedup_group: null
+
+        - operation_type: "MKT"
+          store_id: "7fc25373-e386-4c5b-9039-42fa01979748"
+          env_key: "ESTOCA_0102_MKT_API_KEY"
+          # MKT e CROSS compartilham api_key e estoque — uma única chamada API,
+          # clonagem de registros por operation_type, contagem única no consolidado.
+          dedup_group: "0102_MKT_CROSS"
+
+        - operation_type: "CROSS"
+          store_id: "7fc25373-e386-4c5b-9039-42fa01979748"
+          env_key: "ESTOCA_0102_CROSS_API_KEY"
+          dedup_group: "0102_MKT_CROSS"
+
+    # =========================================================================
+    # LOJA 0103 — Filial Lapa SP (Protheus)
+    # Warehouse: 699dfe96-e547-4fff-aba5-c4e0805fc3f6
+    # =========================================================================
+    - store_code: "0103"
+      business_unit: "LOJA 0103 - LAPA SP"
+      warehouse_id: "699dfe96-e547-4fff-aba5-c4e0805fc3f6"
+      exclude_from_consolidation: false
+      operations:
+        - operation_type: "B2B"
+          store_id: "9b976a6a-54d8-4759-a6c5-d6cc889f7f85"
+          env_key: "ESTOCA_0103_B2B_API_KEY"
+          dedup_group: null
+
+        - operation_type: "B2C"
+          store_id: "c765517a-cb16-4b06-819d-ca9f0e323459"
+          env_key: "ESTOCA_0103_B2C_API_KEY"
+          dedup_group: null
+
+        - operation_type: "MKT"
+          store_id: "fc027865-2fea-45b1-9f98-9dda65c5ae8b"
+          env_key: "ESTOCA_0103_MKT_API_KEY"
+          dedup_group: null
+
+        - operation_type: "CROSS"
+          store_id: "75d202ca-1f77-4939-a04e-8f5121428f30"
+          env_key: "ESTOCA_0103_CROSS_API_KEY"
+          dedup_group: null
+
+    # =========================================================================
+    # AVARIAS LAPA — Loja auxiliar de avarias (Ollie Avarias Lapa)
+    # Mesmo warehouse da Lapa: 699dfe96-e547-4fff-aba5-c4e0805fc3f6
+    # exclude_from_consolidation: true — aparece no detalhado mas NÃO soma no consolidado
+    # =========================================================================
+    - store_code: "AVARIAS"
+      business_unit: "AVARIAS - LAPA SP"
+      warehouse_id: "699dfe96-e547-4fff-aba5-c4e0805fc3f6"
+      exclude_from_consolidation: true
+      operations:
+        - operation_type: "AVARIAS"
+          store_id: "404ffb63-eafe-4798-baa2-73bc2327e7c9"
+          env_key: "ESTOCA_AVARIAS_LAPA_API_KEY"
+          dedup_group: null
