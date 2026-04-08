@@ -136,8 +136,8 @@ def main() -> None:
             )
         else:
             st.success(
-                f"Dados atualizados com sucesso! "
-                f"{fetch_result.total_records} registros obtidos."
+                f"✅ Dados atualizados com sucesso! "
+                f"{fetch_result.total_records} registros obtidos de todas as operações."
             )
 
     fetch_result: FetchResult | None = st.session_state.get("fetch_result")
@@ -153,10 +153,16 @@ def main() -> None:
 
     # ── Banner de erros parciais ───────────────────────────────────────────
     if fetch_result.has_errors:
-        with st.expander(
-            f"⚠️ {len(fetch_result.errors)} operação(ões) com falha — clique para ver detalhes",
-            expanded=False,
-        ):
+        failed_ops = ", ".join(
+            f"{e.store_code}/{e.operation_type}" for e in fetch_result.errors
+        )
+        st.error(
+            f"**⚠️ ATENÇÃO — Dados incompletos!** "
+            f"{len(fetch_result.errors)} operação(ões) falharam durante o fetch: **{failed_ops}**. "
+            "Os saldos exibidos **não refletem o estoque total**. "
+            "Evite tomar decisões com base nesses números. Clique em 🔄 Atualizar Dados para tentar novamente."
+        )
+        with st.expander("Ver detalhes dos erros", expanded=True):
             for err in fetch_result.errors:
                 st.error(
                     f"**{err.store_code} / {err.operation_type}** "
