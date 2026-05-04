@@ -27,6 +27,25 @@ from src.providers.estoca.schemas import (
 )
 
 
+class PartialInventoryError(Exception):
+    """
+    Alguns batches de inventário falharam após todos os retries.
+
+    Inclui os registros parcialmente obtidos para que o chamador
+    ainda possa exibir os dados disponíveis.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        partial_records: list["InventoryRecord"],
+        failed_skus: list[str],
+    ) -> None:
+        super().__init__(message)
+        self.partial_records = partial_records
+        self.failed_skus = failed_skus
+
+
 class EstocaInventoryProvider(InventoryProvider):
     """
     Provider concreto para o WMS Estoca (Brasil).
@@ -106,17 +125,24 @@ class EstocaInventoryProvider(InventoryProvider):
 
         except EstocaAuthError as exc:
             logger.error(f"[{label}] Falha de autenticação em /products: {exc}")
-            return []
+            raise
         except EstocaNotFoundError as exc:
-            logger.warning(f"[{label}] /products retornou 404: {exc}")
-            return []
+            logger.warning(f"[{label}] /products retornou 404 — endpoint não encontrado: {exc}")
+            raise
         except Exception as exc:
             logger.error(f"[{label}] Erro inesperado em /products: {exc}")
-            return []
+            raise
 
         # Deduplica preservando ordem
         seen: set[str] = set()
         unique_skus = [s for s in all_skus if not (s in seen or seen.add(s))]  # type: ignore[func-returns-value]
+
+        if not unique_skus:
+            logger.warning(
+                f"[{label}] /products retornou 0 SKUs (lista vazia). "
+                "Verifique se a operação tem produtos cadastrados no catálogo do WMS "
+                "e se a API key tem permissão para acessar /products."
+            )
 
         logger.info(f"[{label}] {len(unique_skus)} SKUs descobertos.")
         return unique_skus
@@ -159,6 +185,8 @@ class EstocaInventoryProvider(InventoryProvider):
 
         all_records: list[InventoryRecord] = []
         fetched_at = datetime.now(tz=timezone.utc)
+        # Batches que falharam definitivamente após todos os retries: (idx, skus, msg)
+        failed_batches: list[tuple[int, list[str], str]] = []
 
         for batch_idx, batch in enumerate(batches, start=1):
             logger.debug(
@@ -180,6 +208,11 @@ class EstocaInventoryProvider(InventoryProvider):
                     )
                     all_records.append(record)
 
+                logger.debug(
+                    f"[{label}] Batch {batch_idx}/{len(batches)} OK — "
+                    f"{len(parsed.data)} item(s) retornado(s)."
+                )
+
             except EstocaAuthError as exc:
                 logger.error(f"[{label}] Autenticação falhou em batch {batch_idx}: {exc}")
                 raise  # propaga para o service coletar o erro
@@ -189,16 +222,37 @@ class EstocaInventoryProvider(InventoryProvider):
                     f"[{label}] Warehouse ou SKU não encontrado em batch {batch_idx}: {exc}. "
                     "Batch ignorado."
                 )
-                continue  # continua os outros batches
+                continue  # 404 = SKU/warehouse sem registro; não é falha retriável
 
             except Exception as exc:
+                # Inclui EstocaAPIError após exaurir retries do tenacity
                 logger.error(
-                    f"[{label}] Erro em batch {batch_idx}/{len(batches)}: {exc}. "
-                    "Batch ignorado."
+                    f"[{label}] Batch {batch_idx}/{len(batches)} falhou definitivamente "
+                    f"({len(batch)} SKUs): {exc}"
                 )
-                continue
+                failed_batches.append((batch_idx, batch, str(exc)))
+                # Continua tentando os batches restantes
 
-        logger.info(f"[{label}] {len(all_records)} registros de inventário obtidos.")
+        logger.info(
+            f"[{label}] {len(all_records)} registros obtidos | "
+            f"{len(batches) - len(failed_batches)}/{len(batches)} batch(es) com sucesso."
+        )
+
+        if failed_batches:
+            total_failed_skus = sum(len(b) for _, b, _ in failed_batches)
+            errors_summary = " | ".join(
+                f"batch {idx} ({len(b)} SKUs): {msg}"
+                for idx, b, msg in failed_batches
+            )
+            raise PartialInventoryError(
+                message=(
+                    f"{len(failed_batches)}/{len(batches)} batch(es) falharam "
+                    f"— {total_failed_skus} SKU(s) não consultados. {errors_summary}"
+                ),
+                partial_records=all_records,
+                failed_skus=[sku for _, b, _ in failed_batches for sku in b],
+            )
+
         return all_records
 
     # ─── Mapeamento para Modelo Canônico ──────────────────────────────────────

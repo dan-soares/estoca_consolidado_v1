@@ -7,8 +7,9 @@ por operação são injetadas em src/config/stores.py.
 """
 
 from functools import lru_cache
+from typing import Optional
 
-from pydantic import Field
+from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,6 +35,32 @@ class GlobalSettings(BaseSettings):
         default="INFO",
         description="Nível de log: DEBUG, INFO, WARNING, ERROR",
     )
+
+    # Shopify (opcional — sync desabilitado se não configurado)
+    shopify_store_domain: Optional[str] = Field(
+        default=None,
+        validation_alias="SHOPIFY_STORE_DOMAIN",
+        description="Ex: minha-loja.myshopify.com",
+    )
+    shopify_access_token: Optional[str] = Field(
+        default=None,
+        validation_alias="SHOPIFY_ACCESS_TOKEN",
+        description="Token de acesso com scope write_inventory",
+    )
+    shopify_location_id: Optional[str] = Field(
+        default=None,
+        validation_alias="SHOPIFY_LOCATION_ID",
+        description="GID da localização: gid://shopify/Location/123456",
+    )
+
+    @computed_field
+    @property
+    def shopify_enabled(self) -> bool:
+        return bool(
+            self.shopify_store_domain
+            and self.shopify_access_token
+            and self.shopify_location_id
+        )
 
 
 @lru_cache(maxsize=1)

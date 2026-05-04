@@ -20,7 +20,6 @@ Regra de saldo consolidado:
                           pois representa pallets já alocados a pedidos em processo de expedição.
 """
 
-import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -31,6 +30,7 @@ from src.models.inventory import InventoryRecord
 from src.models.store import StoreConfig
 from src.providers.base import InventoryProvider
 from src.providers.estoca.client import EstocaAuthError
+from src.providers.estoca.provider import PartialInventoryError
 
 
 @dataclass
@@ -85,25 +85,98 @@ class InventoryAggregationService:
 
     # ─── Fetch ────────────────────────────────────────────────────────────────
 
-    def fetch_all(self) -> FetchResult:
+    def fetch_all(self, seed_skus: set[str] | None = None) -> FetchResult:
         """
-        Executa o fetch de inventário para todas as lojas/operações.
+        Executa o fetch de inventário para todas as lojas/operações em duas fases.
 
-        Aplica a lógica de dedup_group para evitar chamadas e double-count
-        em operações com credenciais compartilhadas.
+        Fase 1 — Discovery unificado:
+          Parte do seed_skus (SKU registry persistido) e acrescenta os SKUs
+          descobertos via /products de cada operação. O pool resultante garante
+          que SKUs conhecidos nunca sejam omitidos, mesmo que saiam de um catálogo.
 
-        Returns:
-            FetchResult com todos os registros e lista de erros ocorridos.
+        Fase 2 — Consulta de inventário:
+          Cada operação é consultada com o pool global, não apenas com os SKUs
+          do seu próprio catálogo.
+
+        Args:
+            seed_skus: SKUs do registry persistido para usar como semente do pool.
+                       Se None, o pool começa vazio (equivale à primeira execução).
+
+        Aplica dedup_group para evitar double-count de credenciais compartilhadas.
         """
         result = FetchResult()
 
-        # Cache de registros já buscados por dedup_group
-        # dedup_group -> list[InventoryRecord] (registros com operation_type primário)
+        # ── Fase 1: Discovery unificado de SKUs ───────────────────────────────
+        # Parte do seed (registry) e acrescenta os catálogos live de cada operação.
+        # Operações secundárias de dedup_group são puladas (mesma api_key da primária).
+
+        all_skus_union: set[str] = set(seed_skus) if seed_skus else set()
+        if seed_skus:
+            logger.info(f"SKU registry: {len(seed_skus)} SKUs como semente do pool.")
+
+        seen_dedup_groups_phase1: set[str] = set()
+        # Operações com auth error na Fase 1 são puladas na Fase 2 (mesma key falhará)
+        auth_failed_ops: set[tuple[str, str]] = set()
+
+        total_ops = sum(len(s.operations) for s in self.stores)
+        logger.info(
+            f"Fase 1 — discovery de SKUs: {len(self.stores)} loja(s), {total_ops} operação(ões)."
+        )
+
+        for store in self.stores:
+            for op_idx, operation in enumerate(store.operations):
+                label = f"{store.store_code}/{operation.operation_type}"
+
+                if operation.dedup_group is not None:
+                    if operation.dedup_group in seen_dedup_groups_phase1:
+                        continue  # mesmo catálogo da primária
+                    seen_dedup_groups_phase1.add(operation.dedup_group)
+
+                try:
+                    skus = self.provider.get_all_skus(store, op_idx)
+                    all_skus_union.update(skus)
+                    logger.debug(
+                        f"[{label}] +{len(skus)} SKUs (pool acumulado: {len(all_skus_union)})"
+                    )
+                except EstocaAuthError as exc:
+                    logger.error(f"[{label}] Auth error na Fase 1: {exc}")
+                    auth_failed_ops.add((store.store_code, operation.operation_type))
+                    result.errors.append(
+                        OperationError(
+                            store_code=store.store_code,
+                            operation_type=operation.operation_type,
+                            error_type="AuthenticationError",
+                            message=str(exc),
+                        )
+                    )
+                except Exception as exc:
+                    logger.error(f"[{label}] Falha na discovery de SKUs: {exc}")
+                    result.errors.append(
+                        OperationError(
+                            store_code=store.store_code,
+                            operation_type=operation.operation_type,
+                            error_type=f"DiscoveryError",
+                            message=f"Falha ao descobrir SKUs via /products: {exc}",
+                        )
+                    )
+
+        global_skus = sorted(all_skus_union)
+        logger.info(
+            f"Fase 1 concluída: {len(global_skus)} SKUs únicos no pool consolidado."
+        )
+
+        if not global_skus:
+            logger.error("Pool de SKUs vazio — nenhum inventário pode ser consultado.")
+            return result
+
+        # ── Fase 2: Consulta de inventário com pool global ─────────────────────
+        # Cada operação recebe o pool completo de SKUs, garantindo que SKUs
+        # ausentes do catálogo próprio (mas presentes no warehouse) sejam capturados.
+
         dedup_cache: dict[str, list[InventoryRecord]] = {}
 
-        total_stores = len(self.stores)
         logger.info(
-            f"Iniciando fetch de inventário: {total_stores} loja(s) configurada(s)."
+            f"Fase 2 — consulta de inventário: {len(global_skus)} SKUs × {total_ops} operação(ões)."
         )
 
         for store in self.stores:
@@ -113,7 +186,6 @@ class InventoryAggregationService:
                 # ── Verificação de dedup_group ──────────────────────────────
                 if operation.dedup_group is not None:
                     if operation.dedup_group in dedup_cache:
-                        # Operação secundária: clona registros do primário
                         primary_records = dedup_cache[operation.dedup_group]
                         cloned = self._clone_records_for_operation(
                             primary_records, operation, store
@@ -123,24 +195,25 @@ class InventoryAggregationService:
                         result.records.extend(cloned)
                         logger.info(
                             f"[{label}] Dedup group '{operation.dedup_group}': "
-                            f"{len(cloned)} registros clonados do primário "
-                            f"(nenhuma chamada API adicional)."
+                            f"{len(cloned)} registros clonados (sem chamada API)."
                         )
-                        continue  # pula chamada API
+                        continue
 
-                # ── Fetch via provider ──────────────────────────────────────
+                # ── Pula operações que falharam com auth error na Fase 1 ────
+                if (store.store_code, operation.operation_type) in auth_failed_ops:
+                    logger.debug(f"[{label}] Pulando Fase 2 — auth error na Fase 1.")
+                    continue
+
+                # ── Consulta de inventário ──────────────────────────────────
                 try:
-                    logger.info(f"[{label}] Iniciando fetch de inventário...")
-                    records = self.provider.get_full_inventory(store, op_idx)
+                    logger.info(f"[{label}] Consultando inventário com pool global...")
+                    records = self.provider.get_inventory(store, op_idx, global_skus)
                     result.records.extend(records)
 
-                    # Armazena no cache de dedup se aplicável
                     if operation.dedup_group is not None:
                         dedup_cache[operation.dedup_group] = records
 
-                    logger.info(
-                        f"[{label}] Concluído: {len(records)} registros obtidos."
-                    )
+                    logger.info(f"[{label}] Concluído: {len(records)} registros obtidos.")
 
                 except EstocaAuthError as exc:
                     msg = str(exc)
@@ -150,6 +223,21 @@ class InventoryAggregationService:
                             store_code=store.store_code,
                             operation_type=operation.operation_type,
                             error_type="AuthenticationError",
+                            message=msg,
+                        )
+                    )
+
+                except PartialInventoryError as exc:
+                    result.records.extend(exc.partial_records)
+                    if operation.dedup_group is not None:
+                        dedup_cache[operation.dedup_group] = exc.partial_records
+                    msg = str(exc)
+                    logger.warning(f"[{label}] Fetch parcial: {msg}")
+                    result.errors.append(
+                        OperationError(
+                            store_code=store.store_code,
+                            operation_type=operation.operation_type,
+                            error_type="PartialInventoryError",
                             message=msg,
                         )
                     )

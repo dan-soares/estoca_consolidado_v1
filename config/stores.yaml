@@ -37,15 +37,15 @@ estoca:
 
     # =========================================================================
     # LOJA 0103 — Filial Lapa SP (Protheus)
-    # Warehouse: 699dfe96-e547-4fff-aba5-c4e0805fc3f6
+    # Warehouse: dbe38b15-0b0b-4158-8f59-7442457f16b8
     # =========================================================================
     - store_code: "0103"
       business_unit: "LOJA 0103 - LAPA SP"
-      warehouse_id: "699dfe96-e547-4fff-aba5-c4e0805fc3f6"
+      warehouse_id: "dbe38b15-0b0b-4158-8f59-7442457f16b8"
       exclude_from_consolidation: false
       operations:
         - operation_type: "B2B"
-          store_id: "9b976a6a-54d8-4759-a6c5-d6cc889f7f85"
+          store_id: "efa9a6de-4cff-43a5-b8a0-5f19dac4bd8e"
           env_key: "ESTOCA_0103_B2B_API_KEY"
           dedup_group: null
 
@@ -66,12 +66,12 @@ estoca:
 
     # =========================================================================
     # AVARIAS LAPA — Loja auxiliar de avarias (Ollie Avarias Lapa)
-    # Mesmo warehouse da Lapa: 699dfe96-e547-4fff-aba5-c4e0805fc3f6
+    # Mesmo warehouse da Lapa: dbe38b15-0b0b-4158-8f59-7442457f16b8
     # exclude_from_consolidation: true — aparece no detalhado mas NÃO soma no consolidado
     # =========================================================================
     - store_code: "AVARIAS"
       business_unit: "AVARIAS - LAPA SP"
-      warehouse_id: "699dfe96-e547-4fff-aba5-c4e0805fc3f6"
+      warehouse_id: "dbe38b15-0b0b-4158-8f59-7442457f16b8"
       exclude_from_consolidation: true
       operations:
         - operation_type: "AVARIAS"

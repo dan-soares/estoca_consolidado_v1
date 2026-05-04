@@ -116,7 +116,8 @@ class EstocaHttpClient:
 
     @retry(
         retry=retry_if_exception_type(
-            (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.RetryError)
+            (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
+             requests.exceptions.RetryError, EstocaAPIError)
         ),
         wait=wait_exponential(multiplier=1, min=2, max=60),
         stop=stop_after_attempt(5),
@@ -148,7 +149,8 @@ class EstocaHttpClient:
 
     @retry(
         retry=retry_if_exception_type(
-            (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.RetryError)
+            (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
+             requests.exceptions.RetryError, EstocaAPIError)
         ),
         wait=wait_exponential(multiplier=1, min=2, max=60),
         stop=stop_after_attempt(5),

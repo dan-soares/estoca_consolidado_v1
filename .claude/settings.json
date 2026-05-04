@@ -85,7 +85,15 @@
       "Bash(find \"c:/Users/danilo.cruz/Desktop/Consumo de estoque - Estoca\" -name \"__pycache__\" -type d -empty -delete)",
       "Bash(find \"c:/Users/danilo.cruz/Desktop/Consumo de estoque - Estoca/src\" -name \"*.pyc\" -delete)",
       "Bash(find \"c:/Users/danilo.cruz/Desktop/Consumo de estoque - Estoca/src/providers\" -name \"*.pyc\" -delete)",
-      "Bash(find \"c:/Users/danilo.cruz/Desktop/Consumo de estoque - Estoca/src\" \"c:/Users/danilo.cruz/Desktop/Consumo de estoque - Estoca/app\" -name \"*.pyc\" -delete)"
+      "Bash(find \"c:/Users/danilo.cruz/Desktop/Consumo de estoque - Estoca/src\" \"c:/Users/danilo.cruz/Desktop/Consumo de estoque - Estoca/app\" -name \"*.pyc\" -delete)",
+      "Bash(python -m py_compile src/services/aggregation.py)",
+      "Bash(python -m py_compile src/providers/estoca/provider.py)",
+      "Bash(python -m py_compile src/providers/estoca/client.py)",
+      "Bash(python -m py_compile src/config/sku_registry.py)",
+      "Bash(python -m py_compile app/main.py)",
+      "Bash(python scripts/debug_0103.py)",
+      "Bash(python -c ' *)",
+      "WebFetch(domain:shopify.dev)"
     ]
   }
 }

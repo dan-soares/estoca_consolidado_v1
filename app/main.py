@@ -34,6 +34,7 @@ from src.services.aggregation import FetchResult, InventoryAggregationService
 from src.utils.logging import setup_logging
 
 from src.config.sku_mapping import load_sku_mapping
+from src.config.sku_registry import load_registry, save_registry
 from src.models.inventory import InventoryRecord
 
 from app.components.export import render_export_buttons
@@ -43,6 +44,11 @@ from app.components.tables import (
     render_detailed_table,
     render_unified_consolidated_table,
 )
+
+from src.services.validation import ValidationReport, validate_fetch
+from src.services.migration_alerts import MigrationStatus, compute_migration_alerts
+from src.providers.shopify.client import ShopifyAuthError, ShopifyClient
+from src.services.shopify_sync import ShopifySyncResult, sync_consolidated_to_shopify
 
 # ─── Configuração da Página ───────────────────────────────────────────────────
 
@@ -110,6 +116,12 @@ def main() -> None:
     # ── Session State ──────────────────────────────────────────────────────
     if "fetch_result" not in st.session_state:
         st.session_state["fetch_result"] = None
+    if "registry_stats" not in st.session_state:
+        st.session_state["registry_stats"] = None
+    if "validation_report" not in st.session_state:
+        st.session_state["validation_report"] = None
+    if "shopify_sync_result" not in st.session_state:
+        st.session_state["shopify_sync_result"] = None
 
     # ── Sidebar: Botão de atualização e filtros ────────────────────────────
     with st.sidebar:
@@ -123,21 +135,44 @@ def main() -> None:
 
         st.markdown("---")
 
+        registry_stats = st.session_state.get("registry_stats")
+        if registry_stats:
+            if registry_stats["new_count"] > 0:
+                st.info(f"🆕 {registry_stats['new_count']} novos SKUs detectados")
+            st.caption(f"Pool: {registry_stats['total']} SKUs conhecidos")
+
     # ── Fetch de dados ─────────────────────────────────────────────────────
     if refresh_clicked:
         with st.spinner("Consultando a API Estoca... Isso pode levar alguns segundos."):
-            fetch_result: FetchResult = service.fetch_all()
+            registry_skus = load_registry()
+            fetch_result: FetchResult = service.fetch_all(seed_skus=registry_skus)
             st.session_state["fetch_result"] = fetch_result
+
+            # Atualiza registry com todos os SKUs encontrados no inventário
+            inventory_skus = {r.sku for r in fetch_result.records}
+            new_skus = inventory_skus - registry_skus
+            save_registry(registry_skus | inventory_skus)
+            st.session_state["registry_stats"] = {
+                "new_count": len(new_skus),
+                "total": len(registry_skus | inventory_skus),
+            }
+            st.session_state["validation_report"] = validate_fetch(
+                fetch_result, registry_skus
+            )
 
         if fetch_result.has_errors:
             st.warning(
-                f"Fetch concluído com {len(fetch_result.errors)} erro(s). "
+                f"Fetch concluído com {len(fetch_result.errors)} aviso(s). "
                 "Veja detalhes abaixo."
             )
         else:
+            new_count = len(new_skus)
+            registry_total = len(registry_skus | inventory_skus)
+            new_info = f" | 🆕 {new_count} SKU(s) novo(s)" if new_count > 0 else ""
             st.success(
-                f"✅ Dados atualizados com sucesso! "
-                f"{fetch_result.total_records} registros obtidos de todas as operações."
+                f"✅ Dados atualizados! "
+                f"{fetch_result.total_records} registros obtidos. "
+                f"Pool: {registry_total} SKUs conhecidos{new_info}."
             )
 
     fetch_result: FetchResult | None = st.session_state.get("fetch_result")
@@ -192,7 +227,37 @@ def main() -> None:
     _fr = cast(FetchResult, fetch_result)
     filtered_records = [r for r in _fr.records if _record_matches_filters(r, filters)]
     consolidated_df = service.get_consolidated_dataframe(filtered_records)
-    unified_df = service.get_unified_consolidated_dataframe(filtered_records, sku_mapping)
+
+    # Para o Unificado, o filtro de SKU é aplicado APÓS a unificação (no sku_unificado
+    # e nos skus_origem), para que a busca por qualquer componente mostre o total combinado.
+    records_for_unified = [r for r in _fr.records if _record_matches_filters(r, filters, ignore_sku=True)]
+    unified_df_full = service.get_unified_consolidated_dataframe(records_for_unified, sku_mapping)
+    if filters.sku_filter:
+        sku_low = filters.sku_filter.lower()
+        mask = (
+            unified_df_full["sku_unificado"].str.lower().str.contains(sku_low, na=False)
+            | unified_df_full["skus_origem"].str.lower().str.contains(sku_low, na=False)
+        )
+        unified_df = unified_df_full[mask].reset_index(drop=True)
+    else:
+        unified_df = unified_df_full
+
+    # ── Sidebar: alertas de migração e Shopify sync ───────────────────────
+    # Alertas de migração usam o consolidated SEM filtros do usuário:
+    # filtros ativos (ex: busca por SKU) excluiriam o sku_antigo do df
+    # e fariam stock_antigo = 0, classificando como "Concluída" erroneamente.
+    consolidated_df_all = service.get_consolidated_dataframe(list(_fr.records))
+
+    with st.sidebar:
+        if sku_mapping:
+            _render_migration_sidebar(consolidated_df_all, sku_mapping)
+
+        settings = get_settings()
+        if settings.shopify_enabled:
+            _render_shopify_sidebar(
+                unified_df=unified_df,
+                settings=settings,
+            )
 
     # ── Métricas resumidas ─────────────────────────────────────────────────
     _render_metrics(consolidated_df)
@@ -200,10 +265,11 @@ def main() -> None:
     st.markdown("---")
 
     # ── Tabelas ────────────────────────────────────────────────────────────
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📋 Detalhada",
         "📊 Consolidada",
         "🔄 Consolidado SKU Unificado",
+        "🔍 Validação",
     ])
 
     with tab1:
@@ -214,6 +280,9 @@ def main() -> None:
 
     with tab3:
         render_unified_consolidated_table(unified_df, mapping_count=len(sku_mapping))
+
+    with tab4:
+        _render_validation_tab(st.session_state.get("validation_report"))
 
     st.markdown("---")
 
@@ -228,9 +297,15 @@ def main() -> None:
         )
 
 
-def _record_matches_filters(record: InventoryRecord, filters: FilterState) -> bool:
-    """Verifica se um InventoryRecord passa pelos filtros ativos."""
-    if filters.sku_filter and filters.sku_filter.lower() not in record.sku.lower():
+def _record_matches_filters(
+    record: InventoryRecord, filters: FilterState, ignore_sku: bool = False
+) -> bool:
+    """Verifica se um InventoryRecord passa pelos filtros ativos.
+
+    ignore_sku=True pula o filtro de SKU — usado no Consolidado Unificado, onde
+    o SKU é filtrado depois da agregação para incluir todos os componentes do grupo.
+    """
+    if not ignore_sku and filters.sku_filter and filters.sku_filter.lower() not in record.sku.lower():
         return False
     if filters.store_codes and record.store_code not in filters.store_codes:
         return False
@@ -295,6 +370,219 @@ def _render_config_summary(service: InventoryAggregationService) -> None:
                 f"- **{store.business_unit}** ({store.store_code}) — "
                 f"Operações: {ops}{dedup_note}"
             )
+
+
+def _render_validation_tab(report: ValidationReport | None) -> None:
+    """Renderiza a aba de validação de cobertura do fetch."""
+    if report is None:
+        st.info(
+            "Execute um fetch clicando em **🔄 Atualizar Dados** para "
+            "ver o relatório de validação."
+        )
+        return
+
+    st.subheader("Cobertura por Operação")
+    st.caption(
+        "Cobertura = % de SKUs do pool que retornaram saldo > 0 para esta operação. "
+        "Cobertura < 1% pode indicar warehouse_id incorreto."
+    )
+
+    _status_icon = {"OK": "✅", "WARN": "⚠️", "ERROR": "❌"}
+    rows = [
+        {
+            "Status": f"{_status_icon.get(c.status, '')} {c.status}",
+            "Loja": c.store_code,
+            "Operação": c.operation_type,
+            "SKUs c/ Saldo": c.skus_with_stock,
+            "SKUs Consultados": c.skus_queried,
+            "Cobertura %": f"{c.coverage_pct:.1f}%",
+        }
+        for c in report.operation_coverage
+    ]
+    if rows:
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("---")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("SKUs distintos no fetch", f"{report.total_skus_distinct:,}")
+    col2.metric("Total de records", f"{report.total_records:,}")
+    col3.metric(
+        "SKUs do registry sem saldo",
+        len(report.registry_skus_zero_everywhere),
+        help="SKUs conhecidos que retornaram saldo 0 em todas as operações",
+    )
+
+    if report.partial_inventory_ops:
+        with st.expander(
+            f"⚠️ Operações com falha parcial de batch ({len(report.partial_inventory_ops)})",
+            expanded=True,
+        ):
+            for store_code, op_type in report.partial_inventory_ops:
+                st.error(
+                    f"**{store_code}/{op_type}** — fetch parcial: "
+                    "alguns SKUs podem estar ausentes dos saldos."
+                )
+
+    if report.registry_skus_zero_everywhere:
+        with st.expander(
+            f"SKUs do registry sem saldo em nenhuma operação "
+            f"({len(report.registry_skus_zero_everywhere)})",
+            expanded=False,
+        ):
+            st.caption(
+                "Estes SKUs estão no registro histórico mas não retornaram saldo "
+                "em nenhuma operação neste fetch. Podem estar descontinuados ou "
+                "ainda não cadastrados nos warehouses ativos."
+            )
+            st.write(report.registry_skus_zero_everywhere)
+
+    if not report.partial_inventory_ops and not report.registry_skus_zero_everywhere:
+        st.success("✅ Nenhuma anomalia detectada — fetch com cobertura completa.")
+
+    st.caption(
+        f"Validação gerada em: "
+        f"{report.generated_at.strftime('%d/%m/%Y %H:%M:%S')} UTC"
+    )
+
+
+def _render_migration_sidebar(
+    consolidated_df: pd.DataFrame,
+    sku_mapping: dict[str, str],
+) -> None:
+    """Renderiza a seção de alertas de migração de SKU no sidebar."""
+    alerts = compute_migration_alerts(consolidated_df, sku_mapping)
+    if not alerts:
+        return
+
+    urgent = [a for a in alerts if a.status == MigrationStatus.URGENT]
+    monitor = [a for a in alerts if a.status == MigrationStatus.MONITOR]
+
+    st.markdown("---")
+    st.markdown("**🔄 Status de Migração**")
+
+    badge = ""
+    if urgent:
+        badge = f" 🔴 {len(urgent)} urgente(s)"
+    elif monitor:
+        badge = f" 🟡 {len(monitor)} monitorando"
+
+    with st.expander(f"Ver {len(alerts)} mapeamentos{badge}", expanded=bool(urgent)):
+        _icon = {
+            MigrationStatus.DONE: "✅",
+            MigrationStatus.URGENT: "⚠️",
+            MigrationStatus.MONITOR: "📉",
+            MigrationStatus.NORMAL: "ℹ️",
+        }
+        _label = {
+            MigrationStatus.DONE: "Concluída",
+            MigrationStatus.URGENT: "Urgente",
+            MigrationStatus.MONITOR: "Monitorar",
+            MigrationStatus.NORMAL: "Normal",
+        }
+        for alert in alerts:
+            icon = _icon[alert.status]
+            label = _label[alert.status]
+            pct = f"{alert.pct_migrado:.0f}%"
+            if alert.status == MigrationStatus.DONE:
+                detail = "zerado"
+            else:
+                detail = f"{alert.stock_antigo:,} unid."
+            st.markdown(
+                f"{icon} `{alert.sku_antigo}` → `{alert.sku_novo}`  \n"
+                f"&nbsp;&nbsp;&nbsp;&nbsp;{label} — {detail} ({pct} migrado)"
+            )
+
+
+def _render_shopify_sidebar(
+    unified_df: pd.DataFrame,
+    settings,
+) -> None:
+    """Renderiza a seção de sync Shopify no sidebar."""
+    st.markdown("---")
+    st.markdown("**📤 Shopify Sync**")
+    st.caption(f"Loja: `{settings.shopify_store_domain}`")
+
+    active_only = st.toggle(
+        "Apenas SKUs ativos",
+        value=True,
+        key="shopify_active_only",
+        help="Sincroniza somente variantes de produtos com status Ativo na Shopify.",
+    )
+
+    # Confirmação quando o usuário desativa o filtro de ativos
+    sync_enabled = True
+    if not active_only:
+        st.warning(
+            "⚠️ Você está prestes a sincronizar **todos** os SKUs, "
+            "incluindo produtos em **rascunho** e **arquivados**."
+        )
+        confirmed = st.checkbox(
+            "Confirmo — incluir produtos inativos no sync",
+            value=False,
+            key="shopify_inactive_confirmed",
+        )
+        sync_enabled = confirmed
+        if not confirmed:
+            st.caption("Marque a confirmação acima para habilitar o botão.")
+
+    sync_clicked = st.button(
+        "📤 Sincronizar → Shopify",
+        use_container_width=True,
+        disabled=not sync_enabled,
+        help=(
+            "Envia stock_available_consolidated (SKU Unificado) "
+            "para o inventário da Shopify."
+        ),
+    )
+
+    if sync_clicked and sync_enabled:
+        if unified_df.empty:
+            st.warning("Sem dados para sincronizar.")
+        else:
+            sync_df = (
+                unified_df[["sku_unificado", "stock_available_consolidated"]]
+                .rename(columns={"sku_unificado": "sku"})
+            )
+            try:
+                client = ShopifyClient(
+                    store_domain=settings.shopify_store_domain,
+                    access_token=settings.shopify_access_token,
+                )
+                spinner_msg = (
+                    "Buscando produtos ativos e sincronizando..."
+                    if active_only
+                    else "Sincronizando todos os SKUs com Shopify..."
+                )
+                with st.spinner(spinner_msg):
+                    result = sync_consolidated_to_shopify(
+                        sync_df, client, settings.shopify_location_id,
+                        active_only=active_only,
+                    )
+                st.session_state["shopify_sync_result"] = result
+            except ShopifyAuthError as exc:
+                st.error(f"❌ Erro de autenticação Shopify: {exc}")
+            except Exception as exc:
+                st.error(f"❌ Erro inesperado no sync: {exc}")
+
+    sync_result: ShopifySyncResult | None = st.session_state.get("shopify_sync_result")
+    if sync_result:
+        st.caption(
+            f"Último sync: "
+            f"{sync_result.synced_at.strftime('%d/%m/%Y %H:%M')} UTC"
+        )
+        if sync_result.synced_count > 0:
+            st.success(f"✅ {sync_result.synced_count} SKUs sincronizados")
+        if sync_result.skus_not_found:
+            st.warning(
+                f"⚠️ {len(sync_result.skus_not_found)} SKUs não encontrados "
+                f"nos produtos {'ativos ' if st.session_state.get('shopify_active_only', True) else ''}da Shopify"
+            )
+        if sync_result.failed_skus:
+            st.error(f"❌ {len(sync_result.failed_skus)} SKUs com falha no push")
 
 
 if __name__ == "__main__":
